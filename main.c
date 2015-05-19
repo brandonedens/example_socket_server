@@ -45,7 +45,10 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <pthread.h>
+
 #include "server.h"
+#include "work_queue.h"
 
 /*******************************************************************************
  * Constants
@@ -74,9 +77,11 @@
 static int ac;
 static char **av;
 
-struct server *server;
-
 static bool debug;
+
+static bool start_reload;
+
+struct server *server;
 
 /*******************************************************************************
  * Global Variable Definitions
@@ -86,15 +91,115 @@ static bool debug;
  * Local Functions
  */
 
+static void process_events(void *data);
 static void sig_handler(int signum);
 
 /******************************************************************************/
+
+/** Function invoked in work queue that processes server events. */
+static void process_events(void *data)
+{
+	struct server *s = (struct server *)data;
+	while (server_is_running(s)) {
+		server_process_events(s);
+	}
+
+	printf("Thread %lu shutting down.\n", pthread_self());
+}
 
 /** Signal handler. */
 static void sig_handler(int signum)
 {
 	if (SIGUSR2 == signum) {
 		DBG("SIGUSR2 handler invoked.\n");
+		start_reload = true;
+	}
+}
+
+int main(int argc, char *argv[])
+{
+	ac = argc;
+	av = argv;
+
+	struct option long_options[] = {
+		{"debug",  no_argument, 0, 0},
+		{"reload", no_argument, 0, 0},
+		{0,        0,           0, 0},
+	};
+	int c;
+	int option_idx = 0;
+
+	bool reload;
+	while (true) {
+		c = getopt_long(argc, argv, "dr", long_options, &option_idx);
+		if (-1 == c) {
+			break;
+		}
+		switch (c) {
+		case 'd':
+			debug = true;
+			DBG("Debug enabled.\n");
+			break;
+		case 'r':
+			reload = true;
+			break;
+		default:
+			printf("Unhandled option: %o\n", c);
+		}
+	}
+
+	// Begin creating the server. Note that server initialization proceeds
+	// differently based upon whether or not this is a copyover of an
+	// existing server execution.
+	server = server_alloc();
+	if (reload) {
+		DBG("Reloading the server.\n");
+#if 0
+		printf("\tfrom data: %s\n", getenv("reload"));
+#endif
+		int ret = server_restore(server, getenv("reload"));
+		assert(0 == ret);
+		sleep(1);
+	} else {
+		int ret = server_bind(server, "3939");
+		assert(ret >= 0);
+		server_listen(server, 5);
+	}
+
+	server_setup_poll(server);
+
+	// Setup the work queue.
+	struct work_queue *queue = work_queue_alloc();
+	work_queue_init(queue, 4);
+
+	printf("Waiting for connections...\n");
+	for (int i = 0; i < 4; i++) {
+		work_queue_add(queue, process_events, server);
+	}
+
+	// Register signal handling.
+	struct sigaction sa = {
+		.sa_handler = sig_handler,
+		.sa_flags = SA_RESTART,
+	};
+	sigemptyset(&sa.sa_mask);
+	if (0 != sigaction(SIGUSR2, &sa, NULL)) {
+		perror("Failure to set up signal.");
+	}
+
+	// Do nothing while we wait for server to shutdown.
+	while (server_is_running(server)) {
+		sleep(1);
+
+		if (start_reload) {
+			// We've been instructed to reload.
+			server_stop(server);
+		}
+	}
+
+	if (start_reload) {
+		// Join all the threads.
+		work_queue_term(queue);
 
 		// Save server details to the reload environment variable.
 		char buf[128];
@@ -126,71 +231,6 @@ static void sig_handler(int signum)
 
 		// Execute the file.
 		execv(args[0], args);
-	}
-}
-
-int main(int argc, char *argv[])
-{
-	ac = argc;
-	av = argv;
-
-	struct option long_options[] = {
-		{"debug",  no_argument, 0, 0},
-		{"reload", no_argument, 0, 0},
-		{0,        0,           0, 0},
-	};
-	int c;
-	int option_idx = 0;
-
-	bool reload = false;
-	while (true) {
-		c = getopt_long(argc, argv, "dr", long_options, &option_idx);
-		if (-1 == c) {
-			break;
-		}
-		switch (c) {
-		case 'd':
-			debug = true;
-			DBG("Debug enabled.\n");
-			break;
-		case 'r':
-			reload = true;
-			break;
-		default:
-			printf("Unhandled option: %o\n", c);
-		}
-	}
-
-	// Begin creating the server. Note that server initialization proceeds
-	// differently based upon whether or not this is a copyover of an
-	// existing server execution.
-	server = server_alloc();
-	if (reload) {
-		DBG("Reloading the server.\n");
-		printf("\tfrom data: %s\n", getenv("reload"));
-		int ret = server_restore(server, getenv("reload"));
-		assert(0 == ret);
-	} else {
-		int ret = server_bind(server, "3939");
-		assert(ret >= 0);
-		server_listen(server, 5);
-	}
-
-	// Register signal handling.
-	struct sigaction sa = {
-		.sa_handler = sig_handler,
-		.sa_flags = SA_RESTART,
-	};
-	sigemptyset(&sa.sa_mask);
-	if (0 != sigaction(SIGUSR2, &sa, NULL)) {
-		perror("Failure to set up signal.");
-	}
-
-	server_setup_poll(server);
-
-	printf("Waiting for connections...\n");
-	while (!server_is_shutdown(server)) {
-		server_process_events(server);
 	}
 
 	return EXIT_SUCCESS;

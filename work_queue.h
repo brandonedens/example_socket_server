@@ -1,5 +1,5 @@
 /** @file
- * Interface to the socket server.
+ * Interface to software for queuing parallel work.
  *
  *==============================================================================
  * Copyright 2015 by Brandon Edens. All Rights Reserved
@@ -19,40 +19,27 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *
  * @author  Brandon Edens
- * @date    2015-05-11
+ * @date    2015-05-18
  * @details
  *
  */
-#ifndef SERVER_H_
-#define SERVER_H_
-
-/*******************************************************************************
- * Include Files
- */
-
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
+#ifndef WORK_QUEUE_H_
+#define WORK_QUEUE_H_
 
 /*******************************************************************************
  * Global Types
  */
 
-struct server;
+struct work_queue;
 
 /*******************************************************************************
  * Global Functions
  */
-void server_accept(struct server *server);
-struct server *server_alloc(void);
-int server_bind(struct server *server, char const *port);
-bool server_is_running(struct server *server);
-bool server_is_shutdown(struct server *server);
-int server_listen(struct server *server, int backlog);
-void server_process_events(struct server *server);
-int server_restore(struct server *server, char *txt);
-int server_save(struct server *server, size_t len, char buf[len]);
-void server_setup_poll(struct server *server);
-void server_stop(struct server *server);
 
-#endif  // SERVER_H_
+void work_queue_add(struct work_queue *queue, void (*func)(void *), void *data);
+struct work_queue *work_queue_alloc(void);
+void work_queue_free(struct work_queue *queue);
+int work_queue_init(struct work_queue *queue, int num_workers);
+void work_queue_term(struct work_queue *queue);
+
+#endif  // WORK_QUEUE_H_

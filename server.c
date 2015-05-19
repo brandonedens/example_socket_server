@@ -34,6 +34,7 @@
 #include <errno.h>
 #include <err.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -53,10 +54,13 @@
  * Constants
  */
 /** Amount of milliseconds to wait before timing out waiting for an event. */
-#define EVT_WAIT_TIMEOUT 1000
+#define EVT_WAIT_TIMEOUT 100
 
 /** Amount of queued events. */
 #define EVENT_QUEUE 30
+
+/** Poll settings for connection. */
+#define CONN_POLL (EPOLLIN | EPOLLET | EPOLLONESHOT)
 
 /*******************************************************************************
  * Local Types
@@ -79,6 +83,9 @@ struct server {
 	/** Epoll file descriptor. */
 	int ep_fd;
 
+	/** Flag that indicates the server should be polling. */
+	bool running;
+
 	/** Flag that indicates the server is to shutdown. */
 	bool shutdown;
 
@@ -97,8 +104,10 @@ struct server {
  */
 static struct conn *conn_alloc_init(int fd);
 static void conn_close(struct conn *c);
-static ssize_t conn_process_read(struct conn *c);
+static void conn_process_all(struct conn *c, void *data);
+static int conn_process_read(struct conn *c);
 static ssize_t conn_process_write(struct conn *c);
+static void conn_start_polling(struct conn *c, void *data);
 static int do_accept(struct server *server);
 static void *get_in_addr(struct sockaddr *sa);
 static void server_add_conn(struct server *server, struct conn *conn);
@@ -118,6 +127,8 @@ static struct conn *conn_alloc_init(int fd)
 /** Close out a connection. */
 static void conn_close(struct conn *c)
 {
+	printf("Closing connection: %d\n", c->fd);
+	epoll_ctl(c->server->ep_fd, EPOLL_CTL_DEL, c->fd, NULL);
 	close(c->fd);
 }
 
@@ -132,36 +143,47 @@ static void conn_for_each(struct conn *conns,
 	}
 }
 
-/** Process any data available for read from a connection. */
-static ssize_t conn_process_read(struct conn *c)
+/** Process all existing data for a connection. */
+static void conn_process_all(struct conn *c, void *data)
 {
-	uint8_t buf[512];
+	(void)data;
+	conn_process_read(c);
+}
+
+/** Process any data available for read from a connection. */
+static int conn_process_read(struct conn *c)
+{
+	uint8_t buf[8192];
 	size_t total_sz = 0;
 
 	while (true) {
 		ssize_t sz = read(c->fd, buf, sizeof(buf));
-		printf("Received from %d: %zd bytes\n", c->fd, sz);
+#if 0
+		printf("Received %lu from %d: %zd bytes\n", pthread_self(), c->fd, sz);
+#endif
 		if (sz > 0) {
 			total_sz += sz;
 		} else if (sz <= 0) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				// Done reading data for now.
-				break;
-			}
-
 			// Connection closing due to clean shutdown or err.
 			if (sz == 0) {
-				printf("Closing connection.\n");
+				printf("Closing connection: %lu\n",
+						pthread_self());
 			} else {
+				if (errno == EAGAIN || errno == EWOULDBLOCK) {
+					// Done reading data for now.
+					break;
+				}
+
 				printf("Connection failed: %d\n", errno);
 			}
+
 			conn_close(c);
 			server_del_conn(c->server, c);
-			break;
+			return 1;
 		}
 	}
 
-	return total_sz;
+	return 0;
 }
 
 /** Write any data necessary to the client. */
@@ -177,8 +199,8 @@ static void conn_start_polling(struct conn *c, void *data)
 	int ep_fd = *((int *)data);
 
 	struct epoll_event event = {
-		.events = (EPOLLIN | EPOLLET),
 		.data.ptr = c,
+		.events = CONN_POLL,
 	};
 	if (0 != epoll_ctl(ep_fd, EPOLL_CTL_ADD, c->fd, &event)) {
 		perror("Failure to configure conn epoll event.");
@@ -218,7 +240,7 @@ static int do_accept(struct server *server)
 	// Begin polling connection descriptor.
 	struct epoll_event event = {
 		.data = {.ptr = conn},
-		.events = EPOLLIN | EPOLLET,
+		.events = CONN_POLL,
 	};
 	int ret = epoll_ctl(server->ep_fd, EPOLL_CTL_ADD, fd, &event);
 	if (0 != ret) {
@@ -333,6 +355,12 @@ void server_free(struct server *server)
 	free(server);
 }
 
+/** Return true or false if server is running. */
+bool server_is_running(struct server *server)
+{
+	return server->running;
+}
+
 /** Return true or false if server is shutdown. */
 bool server_is_shutdown(struct server *server)
 {
@@ -358,9 +386,11 @@ void server_process_events(struct server *server)
 	                           EVT_WAIT_TIMEOUT);
 	if (-1 == len) {
 		perror("Failure to epoll wait on server.");
+		return;
 	}
 
 	for (int i = 0; i < len; i++) {
+		printf("Server on thread: %lu woke up\n", pthread_self());
 		struct server *ev_server = (struct server *)events[i].data.ptr;
 
 		if ((events[i].events & EPOLLERR) ||
@@ -392,12 +422,29 @@ void server_process_events(struct server *server)
 				}
 			}
 
+			struct epoll_event event = {
+				.events = (EPOLLIN | EPOLLET | EPOLLONESHOT),
+				.data.ptr = ev_server,
+			};
+			epoll_ctl(server->ep_fd, EPOLL_CTL_MOD, ev_server->fd,
+			          &event);
+
 		} else {
 			printf("Handling connection comms.\n");
 			// Handle processing of connection descriptors.
 			struct conn *c = events[i].data.ptr;
-			conn_process_read(c);
-			conn_process_write(c);
+			int ret = conn_process_read(c);
+
+			struct epoll_event event = {
+				.data.ptr = ev_server,
+				.events = CONN_POLL,
+			};
+			if (ret == 0) {
+				conn_process_write(c);
+				epoll_ctl(server->ep_fd, EPOLL_CTL_MOD,
+				          ev_server->fd, &event);
+
+			}
 		}
 	}
 }
@@ -447,14 +494,14 @@ int server_save(struct server *server, size_t len, char buf[len])
 /** Start handling connections for the server. */
 void server_setup_poll(struct server *server)
 {
-	if ((server->ep_fd = epoll_create1(0)) < 0) {
+	if ((server->ep_fd = epoll_create1(EPOLL_CLOEXEC)) < 0) {
 		perror("Failure to create event poll for server.");
 		abort();
 	}
 
 	// Setup server polling for accept.
 	struct epoll_event event = {
-		.events = (EPOLLIN | EPOLLET),
+		.events = (EPOLLIN | EPOLLET | EPOLLONESHOT),
 		.data.ptr = server,
 	};
 	if (0 != epoll_ctl(server->ep_fd, EPOLL_CTL_ADD, server->fd, &event)) {
@@ -464,6 +511,13 @@ void server_setup_poll(struct server *server)
 
 	// For all existing connections begin polling.
 	conn_for_each(server->conns, conn_start_polling, &server->ep_fd);
+
+	server->running = true;
+}
+
+void server_stop(struct server *server)
+{
+	server->running = false;
 }
 
 /** Set a socket to non-blocking mode. */
