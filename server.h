@@ -30,6 +30,7 @@
  * Include Files
  */
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -45,9 +46,11 @@ struct server;
 void server_accept(struct server *server);
 struct server *server_alloc(void);
 int server_bind(struct server *server, char const *port);
+bool server_is_shutdown(struct server *server);
 int server_listen(struct server *server, int backlog);
+void server_process_events(struct server *server);
 int server_restore(struct server *server, char *txt);
 int server_save(struct server *server, size_t len, char buf[len]);
-void server_start(struct server *server);
+void server_setup_poll(struct server *server);
 
 #endif  // SERVER_H_

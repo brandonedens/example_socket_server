@@ -186,8 +186,12 @@ int main(int argc, char *argv[])
 		perror("Failure to set up signal.");
 	}
 
-	printf("Entering accept loop.\n");
-	server_start(server);
+	server_setup_poll(server);
+
+	printf("Waiting for connections...\n");
+	while (!server_is_shutdown(server)) {
+		server_process_events(server);
+	}
 
 	return EXIT_SUCCESS;
 }
