@@ -34,6 +34,7 @@
 #include <errno.h>
 #include <err.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,19 +52,37 @@
 /*******************************************************************************
  * Constants
  */
+/** Amount of milliseconds to wait before timing out waiting for an event. */
+#define EVT_WAIT_TIMEOUT 1000
+
+/** Amount of queued events. */
+#define EVENT_QUEUE 30
 
 /*******************************************************************************
  * Local Types
  */
 
+/** Representation of a connection to the server. */
 struct conn {
 	int fd;
 	struct conn *next;
+	struct conn *prev;
+
+	struct server *server;
 };
 
+/** Representation of a server socket. */
 struct server {
+	/** Socket file descriptor. */
 	int fd;
 
+	/** Epoll file descriptor. */
+	int ep_fd;
+
+	/** Flag that indicates the server is to shutdown. */
+	bool shutdown;
+
+	/** List of server connections. */
 	struct conn *conns;
 };
 
@@ -71,19 +90,20 @@ struct server {
  * Macros
  */
 
-/*******************************************************************************
- * Local Variables
- */
-
-/*******************************************************************************
- * Global Variable Definitions
- */
+#define ARRAY_LEN(x) (sizeof(x) / (sizeof((x)[0])))
 
 /*******************************************************************************
  * Local Functions
  */
+static struct conn *conn_alloc_init(int fd);
+static void conn_close(struct conn *c);
+static ssize_t conn_process_read(struct conn *c);
+static ssize_t conn_process_write(struct conn *c);
+static int do_accept(struct server *server);
 static void *get_in_addr(struct sockaddr *sa);
+static void process_events(struct server *server);
 static void server_add_conn(struct server *server, struct conn *conn);
+static void server_del_conn(struct server *server, struct conn *conn);
 static int set_nonblock(int fd);
 
 /******************************************************************************/
@@ -96,6 +116,120 @@ static struct conn *conn_alloc_init(int fd)
 	return c;
 }
 
+/** Close out a connection. */
+static void conn_close(struct conn *c)
+{
+	close(c->fd);
+}
+
+/** Iterate over the list of connections executing the given function for each
+ * in turn.
+ */
+static void conn_for_each(struct conn *conns,
+                          void (*func)(struct conn *, void *), void *data)
+{
+	for (struct conn *c = conns; NULL != c; c = c->next) {
+		func(c, data);
+	}
+}
+
+/** Process any data available for read from a connection. */
+static ssize_t conn_process_read(struct conn *c)
+{
+	uint8_t buf[512];
+	size_t total_sz = 0;
+
+	while (true) {
+		ssize_t sz = read(c->fd, buf, sizeof(buf));
+		printf("Received from %d: %zd bytes\n", c->fd, sz);
+		if (sz > 0) {
+			total_sz += sz;
+		} else if (sz <= 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				// Done reading data for now.
+				break;
+			}
+
+			// Connection closing due to clean shutdown or err.
+			if (sz == 0) {
+				printf("Closing connection.\n");
+			} else {
+				printf("Connection failed: %d\n", errno);
+			}
+			conn_close(c);
+			server_del_conn(c->server, c);
+			break;
+		}
+	}
+
+	return total_sz;
+}
+
+/** Write any data necessary to the client. */
+static ssize_t conn_process_write(struct conn *c)
+{
+	(void)c;
+	// TODO implement write.
+	return -1;
+}
+
+static void conn_start_polling(struct conn *c, void *data)
+{
+	int ep_fd = *((int *)data);
+
+	struct epoll_event event = {
+		.events = (EPOLLIN | EPOLLET),
+		.data.ptr = c,
+	};
+	if (0 != epoll_ctl(ep_fd, EPOLL_CTL_ADD, c->fd, &event)) {
+		perror("Failure to configure conn epoll event.");
+	}
+}
+
+/** Accept client connections and act as an echo server. */
+static int do_accept(struct server *server)
+{
+	// Accept a connection.
+	struct sockaddr_storage addr;
+	socklen_t sin_size = sizeof(addr);
+	int fd = accept(server->fd, (struct sockaddr *)&addr, &sin_size);
+	if (fd == -1) {
+		if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
+			printf("Done processing connections.\n");
+			// All connections processed.
+			return EAGAIN;
+		}
+
+		// Some other failure occured.
+		perror("Server failed to accept.");
+		abort();
+	}
+	set_nonblock(fd);
+
+	// Recover client address information.
+	char s[INET6_ADDRSTRLEN];
+	inet_ntop(addr.ss_family, get_in_addr((struct sockaddr *)&addr),
+			s, sizeof(s));
+	printf("Server: got connection from %s\n", s);
+
+	// Setup connection.
+	struct conn *conn = conn_alloc_init(fd);
+	server_add_conn(server, conn);
+
+	// Begin polling connection descriptor.
+	struct epoll_event event = {
+		.data = {.ptr = conn},
+		.events = EPOLLIN | EPOLLET,
+	};
+	int ret = epoll_ctl(server->ep_fd, EPOLL_CTL_ADD, fd, &event);
+	if (0 != ret) {
+		perror("Failure to monitor conn fd.");
+		abort();
+	}
+
+	return 0;
+}
+
 /** Get sockaddr, IPv4 or IPv6: */
 static void *get_in_addr(struct sockaddr *sa)
 {
@@ -106,38 +240,56 @@ static void *get_in_addr(struct sockaddr *sa)
 	return &(((struct sockaddr_in6 *)sa)->sin6_addr);
 }
 
-/** Accept client connections and act as an echo server. */
-void server_accept(struct server *server)
+/** Process incoming events for the server and its connections. */
+static void process_events(struct server *server)
 {
-	char s[INET6_ADDRSTRLEN];
-	// Client's address information.
-	struct sockaddr_storage addr;
-	socklen_t sin_size = sizeof(addr);
-	int fd = accept(server->fd, (struct sockaddr *)&addr, &sin_size);
-	if (fd == -1) {
-		perror("accept");
-		return;
+	struct epoll_event events[EVENT_QUEUE];
+	int const len = epoll_wait(server->ep_fd, events, ARRAY_LEN(events),
+	                           EVT_WAIT_TIMEOUT);
+	if (-1 == len) {
+		perror("Failure to epoll wait on server.");
 	}
-	set_nonblock(fd);
 
-	inet_ntop(addr.ss_family, get_in_addr((struct sockaddr *)&addr),
-			s, sizeof(s));
-	warn("Server: got connection from %s", s);
+	for (int i = 0; i < len; i++) {
+		struct server *ev_server = (struct server *)events[i].data.ptr;
 
-	// Setup connection.
-	struct conn *conn = conn_alloc_init(fd);
-	server_add_conn(server, conn);
+		if ((events[i].events & EPOLLERR) ||
+		    (events[i].events & EPOLLHUP) ||
+		    (!(events[i].events & EPOLLIN))) {
 
-	ssize_t len = 0;
-	while (len >= 0) {
-		uint8_t buf[512];
-		len = recv(fd, buf, sizeof(buf), 0);
-		if (len <= 0) {
-			break;
+			// An error has occured on this fd, or the socket is not
+			// ready for reading (why were we notified then?)
+			struct server *srv =
+			    (struct server *)events[i].data.ptr;
+			if (server == srv) {
+				fprintf(stderr, "Failure in server.\n");
+				abort();
+			}
+
+			fprintf(stderr, "epoll conn error\n");
+			struct conn *c = (struct conn *)events[i].data.ptr;
+			conn_close(c);
+			server_del_conn(server, c);
+			continue;
+
+		} else if (ev_server == server) {
+
+			// Accept all waiting connections.
+			while (true) {
+				int ret = do_accept(server);
+				if (EAGAIN == ret) {
+					break;
+				}
+			}
+
+		} else {
+			printf("Handling connection comms.\n");
+			// Handle processing of connection descriptors.
+			struct conn *c = events[i].data.ptr;
+			conn_process_read(c);
+			conn_process_write(c);
 		}
-		len = send(fd, buf, len, 0);
 	}
-	close(fd);
 }
 
 /** Allocate memory for the server. */
@@ -149,6 +301,11 @@ struct server *server_alloc(void)
 /** Add connection to server. */
 static void server_add_conn(struct server *server, struct conn *conn)
 {
+	conn->server = server;
+
+	if (NULL != server->conns) {
+		server->conns->prev = conn;
+	}
 	conn->next = server->conns;
 	server->conns = conn;
 }
@@ -203,6 +360,21 @@ int server_bind(struct server *server, char const *port)
 	return server->fd;
 }
 
+/** Remove connection from the server. */
+static void server_del_conn(struct server *server, struct conn *conn)
+{
+	struct conn *next = conn->next;
+	struct conn *prev = conn->prev;
+	if (NULL != next) {
+		next->prev = prev;
+	}
+	if (NULL != prev) {
+		prev->next = next;
+	} else {
+		server->conns = next;
+	}
+}
+
 /** Free resources allocated for server. */
 void server_free(struct server *server)
 {
@@ -225,8 +397,10 @@ int server_listen(struct server *server, int backlog)
 	return 0;
 }
 
-/** Restore the state of the server from the given text string. This consists of
- * setting up the file descriptors for both the server and its connections.
+/** Restore the state of the server from the given text string.
+ *
+ * This consists of setting up the file descriptors for both the server and its
+ * connections.
  */
 int server_restore(struct server *server, char *txt)
 {
@@ -265,10 +439,34 @@ int server_save(struct server *server, size_t len, char buf[len])
 	return 0;
 }
 
+/** Start handling connections for the server. */
+void server_start(struct server *server)
+{
+	if ((server->ep_fd = epoll_create1(0)) < 0) {
+		perror("Failure to create event poll for server.");
+	}
+
+	// Setup server polling for accept.
+	struct epoll_event event = {
+		.events = (EPOLLIN | EPOLLET),
+		.data.ptr = server,
+	};
+	if (0 != epoll_ctl(server->ep_fd, EPOLL_CTL_ADD, server->fd, &event)) {
+		perror("Failure to configure server epoll event.");
+	}
+
+	// For all existing connections begin polling.
+	conn_for_each(server->conns, conn_start_polling, &server->ep_fd);
+
+	printf("server: waiting for connections...\n");
+	while (!server->shutdown) {
+		process_events(server);
+	}
+}
+
 /** Set a socket to non-blocking mode. */
 static int set_nonblock(int fd)
 {
-#if 0
 	int flags;
 
 	flags = fcntl(fd, F_GETFL);
@@ -280,9 +478,5 @@ static int set_nonblock(int fd)
 	if (fcntl(fd, F_SETFL, flags) < 0) {
 		return -1;
 	}
-#else
-	(void)fd;
-#warning "Non-Blocking sockets disabled until epoll. "
-#endif
 	return 0;
 }

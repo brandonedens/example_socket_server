@@ -187,10 +187,7 @@ int main(int argc, char *argv[])
 	}
 
 	printf("Entering accept loop.\n");
-	while (1) {
-		server_accept(server);
-		sleep(1);
-	}
+	server_start(server);
 
 	return EXIT_SUCCESS;
 }

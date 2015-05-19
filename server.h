@@ -34,22 +34,10 @@
 #include <stdint.h>
 
 /*******************************************************************************
- * Constants
- */
-
-/*******************************************************************************
  * Global Types
  */
 
 struct server;
-
-/*******************************************************************************
- * Global Variables
- */
-
-/*******************************************************************************
- * Macros
- */
 
 /*******************************************************************************
  * Global Functions
@@ -60,5 +48,6 @@ int server_bind(struct server *server, char const *port);
 int server_listen(struct server *server, int backlog);
 int server_restore(struct server *server, char *txt);
 int server_save(struct server *server, size_t len, char buf[len]);
+void server_start(struct server *server);
 
 #endif  // SERVER_H_
