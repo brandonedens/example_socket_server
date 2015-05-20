@@ -1,0 +1,71 @@
+Example Socket Server
+=====================
+:Author: Brandon Edens
+:Email: <brandonedens@gmail.com>
+:Date: 2015-05-19
+:Revision: 1.0
+
+Introduction
+------------
+
+The following software is an example socket server utilizing epoll and a
+threaded work queue system for servicing incoming events. In addition the
+server can be reloaded by sending SIGUSR2 signals to the process which will
+trigger a reload of the software.
+
+Compilation
+-----------
+
+This project uses the link:https://github.com/jpakkane/meson[meson build
+system] for compilation. To build the project with Meson create a build
+directory and instruct meson to setup the build directory via:
+
+[source,bash]
+----
+$ mkdir build
+$ meson . build
+----
+
+Then run ninja to compile the software.
+
+[source,bash]
+----
+$ ninja -C build
+----
+
+If all goes well you should have an executable in your build directory named
+"example-server".
+
+Execution
+---------
+
+Start the server via ./example-server and then utilize telnet or netcat to
+connect to it on port 3939.
+
+[source,bash]
+----
+$ ./build/example_server
+----
+
+[source,bash]
+----
+$ telnet localhost 3939
+----
+
+As a performance test try feeding continuous data to the server.
+
+[source,bash]
+----
+$ nc localhost 3939 < /dev/zero
+----
+
+License
+-------
+
+This software is licensed GNU General Public License v3. You can read the
+license in its entirety at: https://www.gnu.org/licenses/gpl.html
+
+This README file is licensed under the GNU Free Documentation License. You can
+read the license in its entirety at:
+https://www.gnu.org/licenses/fdl.html
+

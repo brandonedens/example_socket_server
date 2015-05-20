@@ -2,12 +2,12 @@
 # Brandon Edens
 # 2015-05-09
 
-project('server_reload', 'c')
+project('example_server', 'c')
 add_global_arguments('-std=gnu11', language : 'c')
 
 dep_pthread = find_library('pthread')
 
-executable('server_reload',
+executable('example_server',
         sources: ['main.c', 'server.c', 'work_queue.c'],
         dependencies: dep_pthread)
 
