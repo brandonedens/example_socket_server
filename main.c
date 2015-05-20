@@ -104,7 +104,9 @@ static void process_events(void *data)
 		server_process_events(s);
 	}
 
+#if 0
 	printf("Thread %lu shutting down.\n", pthread_self());
+#endif
 }
 
 /** Signal handler. */

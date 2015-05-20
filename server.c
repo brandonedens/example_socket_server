@@ -390,7 +390,9 @@ void server_process_events(struct server *server)
 	}
 
 	for (int i = 0; i < len; i++) {
+#if 0
 		printf("Server on thread: %lu woke up\n", pthread_self());
+#endif
 		struct server *ev_server = (struct server *)events[i].data.ptr;
 
 		if ((events[i].events & EPOLLERR) ||
@@ -430,7 +432,9 @@ void server_process_events(struct server *server)
 			          &event);
 
 		} else {
+#if 0
 			printf("Handling connection comms.\n");
+#endif
 			// Handle processing of connection descriptors.
 			struct conn *c = events[i].data.ptr;
 			int ret = conn_process_read(c);
